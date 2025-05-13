@@ -1,15 +1,406 @@
-{
-  "name": "server",
-  "version": "1.0.0",
-  "description": "",
-  "main": "s.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start":"node s.js"
-  },
-  "author": "",
-  "license": "ISC",
-  "dependencies": {
-    "ws": "^8.18.1"
-  }
-}
+import json
+import logging
+from enum import Enum
+import boto3
+from typing import Dict, List, Any, Optional
+import psycopg2
+
+# Configure logging for Lambda (logs to CloudWatch)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Placeholder for DynamoDBService
+class DynamoDBService:
+    _instance = None
+
+    @classmethod
+    def get_instance(cls, region: str) -> Any:
+        if cls._instance is None:
+            cls._instance = boto3.client('dynamodb', region_name=region)
+        return cls._instance
+
+# Placeholder for S3Service
+class S3Service:
+    def __init__(self, region: str):
+        self.client = boto3.client('s3', region_name=region)
+
+    # Add methods as needed (e.g., upload_file, get_object)
+    def placeholder_method(self, *args, **kwargs):
+        logger.warning("S3Service method not implemented")
+        return None
+
+# Placeholder for SQSService
+class SQSService:
+    def __init__(self, region: str):
+        self.client = boto3.client('sqs', region_name=region)
+
+    # Add methods as needed (e.g., send_message)
+    def placeholder_method(self, *args, **kwargs):
+        logger.warning("SQSService method not implemented")
+        return None
+
+# Placeholder for dbService (assumes PostgreSQL)
+class DBService:
+    def __init__(self, connection_params: Dict[str, str]):
+        self.conn_params = connection_params
+
+    async def select_rows(self, query: Dict[str, Any], conn: Optional[Any] = None) -> List[Dict[str, Any]]:
+        connection = conn or psycopg2.connect(**self.conn_params)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(query['text'], query['values'])
+                columns = [desc[0] for desc in cursor.description]
+                rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+                return rows
+        finally:
+            if not conn:
+                connection.close()
+
+    async def update_row(self, query: Dict[str, Any], conn: Optional[Any] = None) -> Dict[str, Any]:
+        connection = conn or psycopg2.connect(**self.conn_params)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(query['text'], query['values'])
+                connection.commit()
+                columns = [desc[0] for desc in cursor.description] if cursor.description else []
+                rows = [dict(zip(columns, row)) for row in cursor.fetchall()] if cursor.description else []
+                return {'rows': rows}
+        finally:
+            if not conn:
+                connection.close()
+
+    async def delete_rows(self, query: Dict[str, Any], conn: Optional[Any] = None) -> None:
+        connection = conn or psycopg2.connect(**self.conn_params)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(query['text'], query['values'])
+                connection.commit()
+        finally:
+            if not conn:
+                connection.close()
+
+# Enum for Type constants
+class Type(Enum):
+    CONTENT = 'CONTENT'
+    PLAYLIST = 'PLAYLIST'
+    SCHEDULE = 'SCHEDULE'
+    PROGRAM = 'PROGRAM'
+    SYNCPLAY = 'SYNCPLAY'
+    GENERAL = 'GENERAL'
+
+class PublishingService:
+    def __init__(self, region: str = 'ap-northeast-1', db_instance: Optional[DBService] = None, 
+                 bucket: str = '', sqs_url: str = '', delay_batch_time: int = 10):
+        self.dynamo_db = DynamoDBService.get_instance(region)
+        self.table_name = 'fcms-screens-publishing-dm'
+        self.s3_service = S3Service(region)
+        self.sqs_service = SQSService(region)
+        self.db_service = db_instance or DBService({})  # Replace with actual connection params
+        self.bucket = bucket
+        self.sqs_url = sqs_url
+        self.delay_batch_time = delay_batch_time
+
+    async def get_shared_status_by_content_id(self, id: str) -> List[Dict[str, Any]]:
+        try:
+            result = await self.db_service.select_rows({
+                'text': 'SELECT is_shared, place_id FROM cms_content WHERE content_id = $1',
+                'values': [id],
+            })
+            if result:
+                result[0]['originalPlaceId'] = result[0]['place_id']
+                result[0]['isShared'] = result[0]['is_shared']
+                return result
+            return []
+        except Exception as e:
+            logger.error(f"[PublishingService][get_shared_status_by_content_id] Failed to get shared status: {str(e)}")
+            return []
+
+    async def get_shared_status_by_playlist_id(self, id: str) -> List[Dict[str, Any]]:
+        try:
+            result = await self.db_service.select_rows({
+                'text': 'SELECT is_shared, place_id FROM cms_playlist WHERE playlist_id = $1',
+                'values': [id],
+            })
+            if result:
+                result[0]['originalPlaceId'] = result[0]['place_id']
+                result[0]['isShared'] = result[0]['is_shared']
+                return result
+            return []
+        except Exception as e:
+            logger.error(f"[PublishingService][get_shared_status_by_playlist_id] Failed to get shared status: {str(e)}")
+            return []
+
+    async def get_shared_status_by_program_id(self, id: str) -> List[Dict[str, Any]]:
+        try:
+            result = await self.db_service.select_rows({
+                'text': 'SELECT is_shared, place_id FROM pms_program WHERE program_id = $1',
+                'values': [id],
+            })
+            if result:
+                result[0]['originalPlaceId'] = result[0]['place_id']
+                result[0]['isShared'] = result[0]['is_shared']
+                return result
+            return []
+        except Exception as e:
+            logger.error(f"[PublishingService][get_shared_status_by_program_id] Failed to get shared status: {str(e)}")
+            return []
+
+    async def get_screens_with_publishing_id(self, id: str, conn: Optional[Any] = None, place_id: Optional[str] = None) -> List[str]:
+        try:
+            query = {
+                'values': [id],
+            }
+            if place_id:
+                query['text'] = 'SELECT screen_id FROM cms_screen_distribution WHERE id = $1 AND place_id = $2'
+                query['values'].append(place_id)
+            else:
+                query['text'] = 'SELECT screen_id FROM cms_screen_distribution WHERE id = $1'
+
+            rows = await self.db_service.select_rows(query, conn)
+            screen_ids = [row['screen_id'] for row in rows]
+            logger.info(f"[PublishingService][get_screens_with_publishing_id] {len(screen_ids)} screen ids for distribution id: {id}, {json.dumps(screen_ids)}")
+            return screen_ids
+        except Exception as e:
+            logger.error(f"[PublishingService][get_screens_with_publishing_id] Fail to get screens ids by distribution id: {id}, {str(e)}")
+            return []
+
+    async def get_publishing(self, screen_id: str) -> List[Dict[str, Any]]:
+        try:
+            rows = await self.db_service.select_rows({
+                'text': 'SELECT * FROM cms_screen_distribution WHERE screen_id = $1',
+                'values': [screen_id],
+            })
+            return rows[0] if rows else []
+        except Exception as e:
+            logger.error(f"[PublishingService][get_publishing] Fail to get publishing by screen id: {screen_id}, {str(e)}")
+            return []
+
+    async def get_publishing_by_content_id(self, id: str) -> List[Dict[str, Any]]:
+        try:
+            return await self.db_service.select_rows({
+                'text': 'SELECT * FROM cms_screen_distribution WHERE id = $1 OR popup_id = $1',
+                'values': [id],
+            })
+        except Exception as e:
+            logger.error(f"[PublishingService][get_publishing_by_content_id] Fail to get publishing by distribution id: {id}, {str(e)}")
+            return []
+
+    async def delete_with_screen_id(self, screen_id: str, conn: Optional[Any] = None) -> None:
+        try:
+            await self.db_service.delete_rows({
+                'text': 'DELETE FROM cms_screen_distribution WHERE screen_id = $1',
+                'values': [screen_id],
+            }, conn)
+        except Exception as e:
+            logger.error(f"[PublishingService][delete_with_screen_id] Fail to delete publishing by screen id: {screen_id}, {str(e)}")
+            raise
+
+    async def get_program(self, id: str) -> Optional[Dict[str, Any]]:
+        try:
+            program = await self.db_service.select_rows({
+                'text': 'SELECT * FROM pms_program WHERE program_id = $1',
+                'values': [id],
+            })
+            return program[0] if program else None
+        except Exception as e:
+            logger.error(f"[PublishingService][get_program] Fail to get program by program id: {id}, {str(e)}")
+            raise
+
+    async def get_content(self, content_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            row_data = await self.db_service.select_rows({
+                'text': '''
+                    SELECT a.*, b.version, b.media_type, b.total_size, b.play_time, b.thumbnail_id,
+                           b.main_file_id, c.file_name, b.resolution, b.orientation
+                    FROM cms_content a
+                    JOIN cms_content_version b ON a.content_id = b.content_id
+                    LEFT JOIN cms_file c ON b.main_file_id = c.file_id
+                    WHERE a.content_id = $1 AND b.is_active = TRUE
+                ''',
+                'values': [content_id],
+            })
+            if not row_data:
+                return None
+
+            content = row_data[0]
+            file_data = await self.db_service.select_rows({
+                'text': 'SELECT * FROM cms_file WHERE file_id = $1',
+                'values': [content['main_file_id']],
+            })
+            if file_data:
+                content['mainFileName'] = file_data[0]['file_name']
+                content['file'] = file_data[0]
+
+            return content
+        except Exception as e:
+            logger.error(f"[PublishingService][get_content] Fail to get content by content id: {content_id}, {str(e)}")
+            return None
+
+    async def get_playlist(self, playlist_id: str) -> Dict[str, Any]:
+        playlist = {}
+        try:
+            query = '''
+                SELECT a.*, b.version, b.total_size, b.play_time, b.is_shuffle, b.out_effect, b.in_effect
+                FROM cms_playlist a
+                JOIN cms_playlist_version b ON a.playlist_id = b.playlist_id
+                WHERE a.playlist_id = $1 AND b.is_active = TRUE
+            '''
+            playlist_result = await self.db_service.select_rows({
+                'text': query,
+                'values': [playlist_id],
+            })
+            logger.info(f"[PublishingService][get_playlist] playlistResult: {json.dumps(playlist_result)}")
+
+            if playlist_result:
+                playlist = playlist_result[0].copy()
+                version = playlist['version']
+                contents_query = '''
+                    SELECT a.*, b.content_name, c.media_type, c.main_file_id, c.thumbnail_id, c.total_size,
+                           d.file_name, d.file_width, d.file_height, d.file_rotation, d.file_duration, d.file_hash,
+                           (SELECT ARRAY_AGG(tag_key) FROM cms_playlist_tag_condition
+                            WHERE playlist_id = a.playlist_id AND content_id = a.content_id
+                            AND content_order = a.content_order AND sync_id = a.sync_id
+                            AND tag_condition_type = 'ALLOW') AS allow_tags,
+                           (SELECT ARRAY_AGG(tag_key) FROM cms_playlist_tag_condition
+                            WHERE playlist_id = a.playlist_id AND content_id = a.content_id
+                            AND content_order = a.content_order AND sync_id = a.sync_id
+                            AND tag_condition_type = 'SKIP') AS skip_tags,
+                           (SELECT DISTINCT tag_apply_type FROM cms_playlist_tag_condition
+                            WHERE playlist_id = a.playlist_id AND content_id = a.content_id
+                            AND content_order = a.content_order AND sync_id = a.sync_id
+                            AND tag_condition_type = 'ALLOW') AS allow_tags_condition,
+                           (SELECT DISTINCT tag_apply_type FROM cms_playlist_tag_condition
+                            WHERE playlist_id = a.playlist_id AND content_id = a.content_id
+                            AND content_order = a.content_order AND sync_id = a.sync_id
+                            AND tag_condition_type = 'SKIP') AS skip_tags_condition
+                    FROM cms_playlist_relation_content a
+                    JOIN cms_content b ON a.content_id = b.content_id
+                    JOIN cms_content_version c ON a.content_id = c.content_id
+                    JOIN cms_file d ON c.main_file_id = d.file_id
+                    WHERE a.playlist_id = $1 AND a.version = $2
+                    ORDER BY a.content_order ASC
+                '''
+                contents = await self.db_service.select_rows({
+                    'text': contents_query,
+                    'values': [playlist_id, version],
+                })
+                logger.info(f"[PublishingService][get_playlist] contents: {json.dumps(contents)}")
+
+                for content in contents:
+                    if not content.get('allow_tags') or not content.get('allow_tags_condition'):
+                        content.pop('allow_tags', None)
+                        content.pop('allow_tags_condition', None)
+                    if not content.get('skip_tags') or not content.get('skip_tags_condition'):
+                        content.pop('skip_tags', None)
+                        content.pop('skip_tags_condition', None)
+
+                if contents:
+                    playlist['contents'] = contents
+
+                playlist['userName'] = playlist.get('updater_name', '')
+
+                sub_playlist_query = '''
+                    SELECT * FROM cms_playlist_relation_sub_playlist
+                    WHERE playlist_id = $1 AND version = $2
+                    ORDER BY content_order
+                '''
+                sub_playlists = await self.db_service.select_rows({
+                    'text': sub_playlist_query,
+                    'values': [playlist_id, version],
+                })
+                logger.info(f"[PublishingService][get_playlist] subPlaylists: {json.dumps(sub_playlists)}")
+
+                if sub_playlists:
+                    playlist['contents'] = playlist.get('contents', []) + sub_playlists
+                    playlist['contents'].sort(key=lambda x: x['content_order'])
+
+                    for index in range(len(playlist['contents']) - 1, -1, -1):
+                        if playlist['contents'][index].get('sub_playlist_id'):
+                            sub_contents_query = '''
+                                SELECT a.*, b.content_name, c.media_type, c.main_file_id, c.thumbnail_id,
+                                       c.total_size, d.file_name, d.file_width, d.file_height, d.file_rotation,
+                                       d.file_duration, d.file_hash
+                                FROM cms_playlist_relation_content a
+                                JOIN cms_content b ON a.content_id = b.content_id
+                                JOIN cms_content_version c ON a.content_id = c.content_id
+                                JOIN cms_file d ON c.main_file_id = d.file_id
+                                WHERE a.playlist_id = $1
+                                AND a.version = (SELECT version FROM cms_playlist_version WHERE playlist_id = $1)
+                                ORDER BY a.content_order ASC
+                            '''
+                            sub_contents = await self.db_service.select_rows({
+                                'text': sub_contents_query,
+                                'values': [playlist['contents'][index]['sub_playlist_id']],
+                            })
+                            if sub_contents:
+                                logger.info(f"[PublishingService][get_playlist] subContents: {json.dumps(sub_contents)}")
+                                for sub_content in sub_contents:
+                                    sub_content['content_order'] += playlist['contents'][index]['content_order']
+                                playlist['contents'][index:index+1] = sub_contents
+
+                    for index, content in enumerate(playlist['contents']):
+                        content['content_order'] = index
+
+            logger.info(f"[PublishingService][get_playlist] playlist: {json.dumps(playlist)}")
+            return playlist
+        except Exception as e:
+            logger.error(f"[PublishingService][get_playlist] Fail to get playlist by playlist id: {playlist_id}, {str(e)}")
+            return {}
+
+    async def get_playlist_ids_by_content_id(self, content_id: str) -> List[str]:
+        try:
+            playlist_ids = await self.db_service.select_rows({
+                'text': 'SELECT DISTINCT playlist_id FROM cms_playlist_relation_content WHERE content_id = $1',
+                'values': [content_id],
+            })
+            ids = [row['playlist_id'] for row in playlist_ids]
+            logger.info(f"[PublishingService][get_playlist_ids_by_content_id] contentId: {content_id}, playlistIds: {json.dumps(ids)}")
+            return ids
+        except Exception as e:
+            logger.error(f"[PublishingService][get_playlist_ids_by_content_id] Fail to get playlist ids by content id: {content_id}, {str(e)}")
+            raise
+
+    async def get_playlist_ids_by_sub_playlist_ids(self, sub_playlist_ids: List[str]) -> List[str]:
+        try:
+            placeholders = ', '.join([f'${i+1}' for i in range(len(sub_playlist_ids))])
+            playlist_ids = await self.db_service.select_rows({
+                'text': f'SELECT DISTINCT playlist_id FROM cms_playlist_relation_sub_playlist WHERE sub_playlist_id IN ({placeholders})',
+                'values': sub_playlist_ids,
+            })
+            ids = [row['playlist_id'] for row in playlist_ids]
+            logger.info(f"[PublishingService][get_playlist_ids_by_sub_playlist_ids] subPlaylistIds: {sub_playlist_ids}, playlistIds: {json.dumps(ids)}")
+            return ids
+        except Exception as e:
+            logger.error(f"[PublishingService][get_playlist_ids_by_sub_playlist_ids] Fail to get playlist ids by subPlaylistIds: {sub_playlist_ids}, {str(e)}")
+            raise
+
+    async def get_program_ids_by_content_id(self, content_id: str) -> List[str]:
+        try:
+            program_ids = await self.db_service.select_rows({
+                'text': '''
+                    SELECT DISTINCT program_id
+                    FROM pms_program_relation_schedule
+                    WHERE schedule_id IN (SELECT schedule_id FROM pms_schedule WHERE content_id = $1)
+                    AND program_id != $1
+                ''',
+                'values': [content_id],
+            })
+            ids = [row['program_id'] for row in program_ids]
+            logger.info(f"[PublishingService][get_program_ids_by_content_id] contentId: {content_id}, programIds: {json.dumps(ids)}")
+            return ids
+        except Exception as e:
+            logger.error(f"[PublishingService][get_program_ids_by_content_id] Fail to get program ids by content id: {content_id}, {str(e)}")
+            raise
+
+    async def get_sync_group(self, id: str) -> List[Dict[str, Any]]:
+        try:
+            sync_data = await self.get_publishing_by_content_id(id)
+            sync = []
+            if sync_data:
+                sync_id_key = 'popup_sync_id' if sync_data[0].get('popup_id') == id else 'sync_id'
+                for data in sync_data:
+                    sync_id = data.get(sync_id_key)
+                    existing = next((group for group in sync if group['sync_id'] == sync_id), None)
+                    if not existing:
+                        sync.append({'sync_id': sync_id, 'screen_ids': []})
+       
